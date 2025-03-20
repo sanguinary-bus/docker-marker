@@ -1,27 +1,74 @@
 import os
+import sys
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 os.environ["IN_STREAMLIT"] = "true"
 
 from marker.settings import settings
+from marker.config.printer import CustomClickPrinter
 from streamlit.runtime.uploaded_file_manager import ( UploadedFile, UploadedFileRec )
-from streamlit.proto.Common_pb2 import FileURLs as FileURLsProto
 
 import base64
 import io
 import subprocess
+import json
 import re
+import string
 import tempfile
 from typing import Any, Dict
-import uuid
+import click
 
 import pypdfium2
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.config.parser import ConfigParser
 from marker.output import text_from_rendered
+from marker.schema import BlockTypes
+
+COLORS = [
+    "#4e79a7",
+    "#f28e2c",
+    "#e15759",
+    "#76b7b2",
+    "#59a14f",
+    "#edc949",
+    "#af7aa1",
+    "#ff9da7",
+    "#9c755f",
+    "#bab0ab"
+]
+
+with open(
+    os.path.join(os.path.dirname(__file__), "streamlit_app_blocks_viz.html"), encoding="utf-8"
+) as f:
+    BLOCKS_VIZ_TMPL = string.Template(f.read())
+
+
+@st.cache_data()
+def parse_args():
+    # Use to grab common cli options
+    @ConfigParser.common_options
+    def options_func():
+        pass
+
+    def extract_click_params(decorated_function):
+        if hasattr(decorated_function, '__click_params__'):
+            return decorated_function.__click_params__
+        return []
+
+    cmd = CustomClickPrinter("Marker app.")
+    extracted_params = extract_click_params(options_func)
+    cmd.params.extend(extracted_params)
+    ctx = click.Context(cmd)
+    try:
+        cmd_args = sys.argv[1:]
+        cmd.parse_args(ctx, cmd_args)
+        return ctx.params
+    except click.exceptions.ClickException as e:
+        return {"error": str(e)}
 
 @st.cache_resource()
 def load_models():
@@ -36,7 +83,8 @@ def convert_pdf(fname: str, config_parser: ConfigParser) -> (str, Dict[str, Any]
         config=config_dict,
         artifact_dict=model_dict,
         processor_list=config_parser.get_processors(),
-        renderer=config_parser.get_renderer()
+        renderer=config_parser.get_renderer(),
+        llm_service=config_parser.get_llm_service()
     )
     return converter(fname)
 
@@ -89,25 +137,55 @@ def page_count(pdf_file: UploadedFile):
         return 1
 
 
+def pillow_image_to_base64_string(img: Image) -> str:
+    buffered = io.BytesIO()
+    img.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
+def block_display(image: Image, blocks: dict | None = None, dpi=96):
+    if blocks is None:
+        blocks = {}
+
+    image_data_url = (
+        'data:image/jpeg;base64,' + pillow_image_to_base64_string(image)
+    )
+
+    template_values = {
+        "image_data_url": image_data_url,
+        "image_width": image.width, "image_height": image.height,
+        "blocks_json": blocks, "colors_json": json.dumps(COLORS),
+        "block_types_json": json.dumps({
+            bt.name: i for i, bt in enumerate(BlockTypes)
+        })
+    }
+    return components.html(
+        BLOCKS_VIZ_TMPL.substitute(**template_values),
+        height=image.height
+    )
+
+
 st.set_page_config(layout="wide")
 col1, col2 = st.columns([.5, .5])
 
 model_dict = load_models()
+cli_options = parse_args()
 
 
 st.markdown("""
-# Marker
+# Marker Demo
 
 This app will let you try marker, a PDF or image -> Markdown, HTML, JSON converter. It works with any language, and extracts images, tables, equations, etc.
 
 Find the project [here](https://github.com/VikParuchuri/marker).
 """)
 
-in_file: UploadedFile = st.sidebar.file_uploader("PDF or image file:", type=["pdf"])
+in_file: UploadedFile = st.sidebar.file_uploader("PDF, document, or image file:", type=["pdf", "png", "jpg", "jpeg", "gif", "pptx", "docx", "xlsx", "html", "epub"])
 
 if in_file is None:
     st.stop()
 
+# by szczynk
 # Session state initialization for processed PDF
 if 'processed_pdf' not in st.session_state:
     st.session_state.processed_pdf = None
@@ -120,6 +198,7 @@ if st.session_state.processed_pdf is not None and st.session_state.processed_pdf
 
 filetype = in_file.type
 
+# by szczynk
 # PDF processing controls
 with st.sidebar.expander("PDF Processing Options") as processing_opt:
     trim_size = st.text_input("Trim size (e.g., '0mm 36mm 0mm 33mm')", value="0mm 36mm 0mm 33mm")
@@ -182,7 +261,11 @@ with col1:
     page_count = page_count(in_file)
     page_number = st.number_input(f"Page number out of {page_count}:", min_value=0, value=0, max_value=page_count)
     pil_image = get_page_image(in_file, page_number)
-    st.image(pil_image, caption="File preview", use_container_width=True)
+    image_placeholder = st.empty()
+
+    with image_placeholder:
+        block_display(pil_image)
+
 
 page_range = st.sidebar.text_input("Page range to parse, comma separated like 0,5-10,20", value=f"{page_number}-{page_count}")
 output_format = st.sidebar.selectbox("Output format", ["markdown", "json", "html"], index=0)
@@ -190,6 +273,21 @@ run_marker = st.sidebar.button("Run Marker")
 
 with st.sidebar.expander("Advanced Options") as advanced_opt:
     use_llm = st.checkbox("Use LLM", help="Use LLM for higher quality processing", value=False)
+    
+    # by szczynk
+    if use_llm:
+        llm_service = st.sidebar.selectbox(
+            "LLM Service",
+            ["marker.services.ollama.OllamaService", "marker.services.gemini.GoogleGeminiService"],
+            index=0
+        )
+
+        # If OllamaService is selected, show additional inputs
+        if llm_service == "marker.services.ollama.OllamaService":
+            ollama_base_url = st.sidebar.text_input("Ollama Base URL", value="http://172.17.0.1:11434")
+            ollama_model = st.sidebar.text_input("Ollama Model", value="llama3.2-vision")
+
+    show_blocks = st.checkbox("Show Blocks", help="Display detected blocks, only when output is JSON", value=False, disabled=output_format != "json")
     force_ocr = st.checkbox("Force OCR", help="Force OCR on all pages", value=False)
     strip_existing_ocr = st.checkbox("Strip existing OCR", help="Strip existing OCR text from the PDF and re-OCR.", value=False)
     debug = st.checkbox("Debug", help="Show debug information", value=False)
@@ -211,6 +309,15 @@ with tempfile.NamedTemporaryFile(suffix=".pdf", mode="wb+") as temp_pdf:
         "use_llm": use_llm,
         "strip_existing_ocr": strip_existing_ocr
     }
+    
+    # by szczynk
+    if use_llm:
+        cli_options["llm_service"] = llm_service
+
+        if llm_service == "marker.services.ollama.OllamaService":
+            cli_options["ollama_base_url"] = ollama_base_url
+            cli_options["ollama_model"] = ollama_model
+
     config_parser = ConfigParser(cli_options)
     rendered = convert_pdf(
         filename,
@@ -220,8 +327,8 @@ with tempfile.NamedTemporaryFile(suffix=".pdf", mode="wb+") as temp_pdf:
     first_page = page_range[0] if page_range else 0
 
 text, ext, images = text_from_rendered(rendered)
-
 with col2:
+    # by szczynk
     # Streamlit's download button to download the file
     file_name = f"{in_file.name}.{ext}"
     col1, col2, col3 = st.columns(3)
@@ -246,6 +353,9 @@ with col2:
     elif output_format == "html":
         st.html(text)
 
+if output_format == "json" and show_blocks:
+    with image_placeholder:
+        block_display(pil_image, text)
 
 if debug:
     with col1:
@@ -257,3 +367,5 @@ if debug:
             layout_image_path = os.path.join(debug_data_path, f"layout_page_{first_page}.png")
             img = Image.open(layout_image_path)
             st.image(img, caption="Layout debug image", use_container_width=True)
+        st.write("Raw output:")
+        st.code(text, language=output_format)
